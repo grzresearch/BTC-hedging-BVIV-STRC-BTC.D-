@@ -7,8 +7,8 @@
                                                       # same pipeline on Binance + Bitfinex BVIV data
 
 Stages: train (rule selection on training seeds) -> test (Monte Carlo on disjoint
-test seeds) -> robust (scenario grid) -> placebo (timing placebo for the ratchet)
--> paper (figures, tables, macros, PDF).
+test seeds) -> robust (scenario grid) -> placebo (timing placebo for the selected
+ratchet) -> placebo-grid (every ratchet configuration vs. its placebo) -> paper.
 """
 
 from __future__ import annotations
@@ -105,6 +105,35 @@ def stage_placebo(n: int, params: MarketParams, cfg: HedgeConfig, selection: dic
     mc["metrics"].to_csv(RESULTS / "placebo.csv", index=False)
 
 
+GRID_SHIFTS = (91, 147, 203)
+GRID_PATHS = 64
+
+
+def stage_placebo_grid(params: MarketParams, cfg: HedgeConfig):
+    """Every ratchet configuration of the grid against its own timing placebos."""
+    ratchets = [r for r in rule_grid() if r.kind == "ratchet"]
+    placebos = [Rule(f"{r.name}|shift{d}", "ratchet", z_enter=r.z_enter, halflife_days=r.halflife_days, floor=r.floor,
+                     use_forecast=r.use_forecast, placebo_shift_days=float(d)) for r in ratchets for d in GRID_SHIFTS]
+    rules = [Rule("Unhedged", "unhedged"), rule_from_key("always|1"), *ratchets, *placebos]
+    mc = monte_carlo(range(GRID_PATHS), params, cfg, rules, Protocol(full_forecasts=False))
+    mc["metrics"][["strategy", "seed", "es_red", "var_red", "hedge_cost"]].to_csv(RESULTS / "placebo_grid.csv", index=False)
+
+
+def placebo_grid_summary(grid: pd.DataFrame) -> dict[str, float]:
+    """Timing value (real minus mean placebo ES reduction) per configuration, with paired bootstrap CIs."""
+    w = grid.pivot(index="seed", columns="strategy", values="es_red")
+    real = [c for c in w.columns if c.startswith("ratchet|") and "|shift" not in c]
+    rows = []
+    for c in real:
+        fake = w[[f"{c}|shift{d}" for d in GRID_SHIFTS]].mean(axis=1)
+        d = pd.DataFrame({"seed": w.index, "strategy": "diff", "es_red": (w[c] - fake).to_numpy()})
+        st = paired(pd.concat([d, d.assign(strategy="zero", es_red=0.0)]), "es_red", "diff", "zero")
+        rows.append(st)
+    t = pd.DataFrame(rows)
+    return {"n": len(t), "mean": float(t["mean"].mean()), "min": float(t["mean"].min()), "max": float(t["mean"].max()),
+            "sig_pos": int((t["lo"] > 0).sum()), "sig_neg": int((t["hi"] < 0).sum())}
+
+
 def placebo_summary(placebo: pd.DataFrame, ratchet_key: str) -> dict[str, float]:
     w = placebo.pivot(index="seed", columns="strategy", values="es_red")
     fake = w[[c for c in w.columns if c.startswith("placebo|")]].mean(axis=1)
@@ -112,6 +141,22 @@ def placebo_summary(placebo: pd.DataFrame, ratchet_key: str) -> dict[str, float]
     zero = d.assign(strategy="zero", es_red=0.0)
     stats = paired(pd.concat([d, zero]), "es_red", "diff", "zero")
     return {"es_placebo": float(fake.median()), "es_ratchet": float(w[ratchet_key].median()), **stats}
+
+
+def crash_cluster_diagnostic(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str], n: int = 24) -> dict[str, float]:
+    """Hedge-leg P&L on the hedged book's own worst 2.5% days, baseline vs. crashes clustered in stress."""
+    rules = [Rule("Unhedged", "unhedged"), rule_from_key("always|1"), rule_from_key(selection["ratchet"])]
+    out = {}
+    for scen, p in (("base", params), ("cluster", params.with_(**{k: v for k, v, _ in SCENARIOS}["Crashes cluster in stress"]))):
+        acc = {"always|1": [], selection["ratchet"]: []}
+        for seed in range(n):
+            res = analyse(simulate_market(p, seed).bars, cfg, rules, Protocol(full_forecasts=False))
+            for key in acc:
+                book = res["books"][key].loc[res["hedge_start"]:]
+                worst = book["total"] <= book["total"].quantile(0.025)
+                acc[key].append(100 * book["hedge"][worst].mean())
+        out[scen] = {k: float(sum(v) / len(v)) for k, v in acc.items()}
+    return out
 
 
 def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str], compile_pdf: bool):
@@ -123,6 +168,7 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
     calib = pd.read_csv(RESULTS / "test_calibration.csv")
     robust = pd.read_csv(RESULTS / "robustness.csv")
     placebo = placebo_summary(pd.read_csv(RESULTS / "placebo.csv"), selection["ratchet"])
+    pgrid = placebo_grid_summary(pd.read_csv(RESULTS / "placebo_grid.csv"))
     sw, rt = selection["switch"], selection["ratchet"]
 
     # ---- figures on a representative path (test seed 0)
@@ -153,9 +199,13 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
         ("worst_day", "Worst daily loss (\\%)", "fat left tail", 1),
     ], tab_dir / "calibration.tex")
     report.table_forecasts(fsum, tab_dir / "forecasts.tex")
-    order = [("Unhedged", "Unhedged"), ("always|1", "Always-on (MV)"), (sw, "VWAP-switch"), (rt, "VWAP-ratchet"),
+    pl = pd.read_csv(RESULTS / "placebo.csv")
+    pl = pl[pl["strategy"].str.startswith("placebo|")].groupby("seed").mean(numeric_only=True)
+    med_tab = pd.concat([med_all, pl.median().rename("placebo").to_frame().T])
+    order = [("Unhedged", "Unhedged"), ("always|1", "Always-on (MV)"), ("always|1.5", "Always-on, 1.5$\\times$"),
+             (sw, "VWAP-switch"), (rt, "VWAP-ratchet"), ("placebo", "Ratchet, placebo timing"),
              ("oracle|1", "Oracle (infeasible)")]
-    report.table_hedging(med_all, order, [
+    report.table_hedging(med_tab, order, [
         ("es_red", "ES red.", 1), ("var_red", "Var red.", 1), ("mdd", "Max DD", 1), ("tail_offset", "Tail offset", 1),
         ("carry", "Carry", 2), ("cost", "Trading", 2), ("turnover", "Turnover", 1), ("time_on", "Time on", 0),
     ], tab_dir / "hedging.tex")
@@ -165,6 +215,15 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
     d_rt = paired(test, "es_red", rt, "always|1")
     d_sw = paired(test, "es_red", sw, "always|1")
     d_mdd = paired(test, "mdd", rt, "always|1")
+    d_var = paired(test, "var_red", rt, "always|1")
+    d_tail = paired(test, "tail_offset", rt, "always|1")
+    fc_twin = rt[:-1] + ("1" if rt.endswith("0") else "0")
+    d_fc = paired(test, "es_red", fc_twin, rt)
+    ladder = med_all[med_all.index.str.startswith("always|")]
+    grid = med_all[med_all.index.str.startswith("ratchet|")]
+    best_static = grid["hedge_cost"].map(lambda c: ladder.loc[ladder["hedge_cost"] <= c, "es_red"].max())
+    above = float((grid["es_red"] > best_static.fillna(-1e9)).mean())
+    diag = crash_cluster_diagnostic(params, cfg, selection)
     rr, ss = rule_from_key(rt), rule_from_key(sw)
     f = fsum.set_index(["h", "model"])
     nums = {
@@ -182,6 +241,14 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
         "share_ratchet": f"{100 * d_rt['share_pos']:.0f}", "d_es_switch": f"{d_sw['mean']:+.2f}",
         "d_mdd_ratchet": f"{d_mdd['mean']:+.2f}",
         "es_red_always_two": med_all.loc["always|2", "es_red"], "es_red_always_three": med_all.loc["always|3", "es_red"],
+        "es_red_always_onehalf": med_all.loc["always|1.5", "es_red"], "cost_always_onehalf": f"{med_all.loc['always|1.5', 'hedge_cost']:.2f}",
+        "var_red_always_onehalf": med_all.loc["always|1.5", "var_red"], "var_red_switch": med_all.loc[sw, "var_red"],
+        "d_var_ratchet": f"{d_var['mean']:+.2f}", "d_tail_ratchet": f"{d_tail['mean']:+.1f}",
+        "share_tail_ratchet": f"{100 * d_tail['share_pos']:.0f}", "d_es_switch_lo": f"{d_sw['lo']:+.2f}", "d_es_switch_hi": f"{d_sw['hi']:+.2f}",
+        "d_es_fc": f"{d_fc['mean']:+.2f}", "d_es_fc_lo": f"{d_fc['lo']:+.2f}", "d_es_fc_hi": f"{d_fc['hi']:+.2f}",
+        "share_above_ladder": f"{100 * above:.0f}", "n_ratchet_grid": f"{len(grid)}",
+        "diag_base_always": f"{diag['base']['always|1']:+.2f}", "diag_base_ratchet": f"{diag['base'][rt]:+.2f}",
+        "diag_cluster_always": f"{diag['cluster']['always|1']:+.2f}", "diag_cluster_ratchet": f"{diag['cluster'][rt]:+.2f}",
         "ratchet_z": f"{rr.z_enter:g}", "ratchet_hl": f"{rr.halflife_days:g}", "ratchet_floor": f"{rr.floor:g}",
         "ratchet_fc": "with" if rr.use_forecast else "without",
         "switch_z": f"{ss.z_enter:g}", "switch_exit": f"{ss.z_exit:g}",
@@ -189,16 +256,23 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
         "ql_iv_thirty": f"{f.loc[(30, 'IV'), 'qlike_ratio']:.2f}", "ql_har_iv_thirty": f"{f.loc[(30, 'HAR-IV'), 'qlike_ratio']:.2f}",
         "ql_garch_one": f"{f.loc[(1, 'GARCH'), 'qlike_ratio']:.2f}", "ql_ivraw_thirty": f"{f.loc[(30, 'IV-raw'), 'qlike_ratio']:.2f}",
         "ql_har_iv_seven": f"{f.loc[(7, 'HAR-IV'), 'qlike_ratio']:.2f}", "ql_iv_seven": f"{f.loc[(7, 'IV'), 'qlike_ratio']:.2f}",
+        "dm_win_har_iv_one": f"{f.loc[(1, 'HAR-IV'), 'dm_win']:.0f}", "dm_loss_har_iv_one": f"{f.loc[(1, 'HAR-IV'), 'dm_loss']:.0f}",
+        "dm_win_iv_thirty": f"{f.loc[(30, 'IV'), 'dm_win']:.0f}", "dm_loss_iv_thirty": f"{f.loc[(30, 'IV'), 'dm_loss']:.0f}",
         "corr_daily": f"{calib['corr_daily'].median():.2f}", "corr_down": f"{calib['corr_down'].median():.2f}",
         "corr_up": f"{calib['corr_up'].median():.2f}", "vrp": calib["vrp"].median(),
         "hedge_carry": f"{params.hedge_carry:g}", "fee": f"{cfg.fee_bps:g}", "slip": f"{cfg.slippage_bps:g}",
         "es_red_placebo": placebo["es_placebo"], "d_es_placebo": f"{placebo['mean']:+.2f}",
         "d_es_placebo_lo": f"{placebo['lo']:+.2f}", "d_es_placebo_hi": f"{placebo['hi']:+.2f}",
         "share_placebo": f"{100 * placebo['share_pos']:.0f}", "n_placebo": f"{len(PLACEBO_SHIFTS)}",
+        "pgrid_n": f"{pgrid['n']}", "pgrid_mean": f"{pgrid['mean']:+.2f}", "pgrid_min": f"{pgrid['min']:+.2f}",
+        "pgrid_max": f"{pgrid['max']:+.2f}", "pgrid_sig_pos": f"{pgrid['sig_pos']}", "pgrid_sig_neg": f"{pgrid['sig_neg']}",
+        "pgrid_paths": f"{GRID_PATHS}", "pgrid_shifts": f"{len(GRID_SHIFTS)}",
     }
     for r in robust.to_dict("records"):
         key = "rob." + r["scenario"].lower().replace("x0.5", "half").replace("x2", "double").replace(" 0", " zero").replace(" 12", " twelve")
         nums[key] = f"{r['d_mean']:+.2f}"
+        nums[key.replace("rob.", "rob lo.")] = f"{r['d_lo']:+.2f}"
+        nums[key.replace("rob.", "rob hi.")] = f"{r['d_hi']:+.2f}"
     report.write_numbers(nums, PAPER / "numbers.tex")
 
     if compile_pdf:
@@ -241,7 +315,7 @@ def run_live(args, cfg: HedgeConfig, selection: dict[str, str]):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--stage", choices=["all", "train", "test", "robust", "placebo", "paper"], default="all")
+    ap.add_argument("--stage", choices=["all", "train", "test", "robust", "placebo", "placebo-grid", "paper"], default="all")
     ap.add_argument("--quick", action="store_true", help="few paths, for a smoke test")
     ap.add_argument("--train-paths", type=int, default=48)
     ap.add_argument("--test-paths", type=int, default=200)
@@ -273,6 +347,8 @@ def main():
         stage_robust(args.robust_paths, params, cfg, selection)
     if args.stage in ("all", "placebo"):
         stage_placebo(args.test_paths, params, cfg, selection)
+    if args.stage in ("all", "placebo-grid"):
+        stage_placebo_grid(params, cfg)
     if args.stage in ("all", "paper"):
         stage_paper(params, cfg, selection, compile_pdf=not args.no_pdf)
 
