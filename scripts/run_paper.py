@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from bvivhedge.experiments import (  # noqa: E402
     summarise_forecasts, summarise_metrics,
 )
 from bvivhedge.hedge import HedgeConfig, Rule  # noqa: E402
+from bvivhedge.vwap import gate_state  # noqa: E402
 from bvivhedge.simulate import MarketParams, simulate_market  # noqa: E402
 
 RESULTS = ROOT / "results"
@@ -150,6 +152,8 @@ def placebo_grid_summary(grid: pd.DataFrame) -> dict[str, float]:
             "es_floor_zero": float(t.loc[t["floor"] == 0.0, "es"].mean()), "es_floor_one": float(t.loc[t["floor"] == 1.0, "es"].mean()),
             "best_es": float(t.loc[best, "es"]), "best_cost": float(t.loc[best, "cost"]),
             "corr": float(np.corrcoef(t["mean"], t["es"])[0, 1]),
+            "sig_pos_zero": int(((t["lo"] > 0) & (t["floor"] == 0.0)).sum()), "n_zero": int((t["floor"] == 0.0).sum()),
+            "neg_point": int((t["mean"] < 0).sum()),
             "always_es": float(w["always|1"].median())}
 
 
@@ -162,19 +166,42 @@ def placebo_summary(placebo: pd.DataFrame, ratchet_key: str) -> dict[str, float]
     return {"es_placebo": float(fake.median()), "es_ratchet": float(w[ratchet_key].median()), **stats}
 
 
-def crash_cluster_diagnostic(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str], n: int = 24) -> dict[str, float]:
-    """Hedge-leg P&L on the hedged book's own worst 2.5% days, baseline vs. crashes clustered in stress."""
-    rules = [Rule("Unhedged", "unhedged"), rule_from_key("always|1"), rule_from_key(selection["ratchet"])]
-    out = {}
+def crash_cluster_diagnostic(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str], n: int = 24) -> dict:
+    """Diagnostics on the first ``n`` test paths.
+
+    * hedge-leg P&L on the hedged book's own worst 2.5% of days, baseline vs. crashes clustered in stress;
+    * share of the unhedged book's worst 2.5% of days that contain no stress-regime bar;
+    * share of VWAP-switch openings not followed by one of the worst 5% of days within 24 hours.
+    """
+    rules = [Rule("Unhedged", "unhedged"), rule_from_key("always|1"), rule_from_key(selection["switch"]),
+             rule_from_key(selection["ratchet"])]
+    sw = rule_from_key(selection["switch"])
+    out, outside, false_alarm = {}, [], []
     for scen, p in (("base", params), ("cluster", params.with_(**{k: v for k, v, _ in SCENARIOS}["Crashes cluster in stress"]))):
         acc = {"always|1": [], selection["ratchet"]: []}
         for seed in range(n):
-            res = analyse(simulate_market(p, seed).bars, cfg, rules, Protocol(full_forecasts=False))
+            bars = simulate_market(p, seed).bars
+            res = analyse(bars, cfg, rules, Protocol(full_forecasts=False))
+            start = res["hedge_start"]
             for key in acc:
-                book = res["books"][key].loc[res["hedge_start"]:]
+                book = res["books"][key].loc[start:]
                 worst = book["total"] <= book["total"].quantile(0.025)
                 acc[key].append(100 * book["hedge"][worst].mean())
+            if scen == "base":
+                unhedged = res["books"]["Unhedged"].loc[start:, "total"]
+                stress_day = (bars["regime"] == 1).groupby(bars.index.floor("1D")).any().reindex(unhedged.index)
+                tail = unhedged <= unhedged.quantile(0.025)
+                outside.append(float((~stress_day[tail]).mean()))
+                gate = pd.Series(gate_state(res["signals"]["z"].to_numpy(), sw.z_enter, sw.z_exit, sw.min_hold),
+                                 index=bars.index).loc[start:]
+                opens = gate.index[(gate.diff() == 1).to_numpy()]
+                bad = set(unhedged.index[unhedged <= unhedged.quantile(0.05)])
+                hits = [any(d in bad for d in (t.floor("1D"), (t + pd.Timedelta("1D")).floor("1D"))) for t in opens]
+                false_alarm.append(1.0 - float(np.mean(hits)) if hits else np.nan)
         out[scen] = {k: float(sum(v) / len(v)) for k, v in acc.items()}
+    out["tail_outside_stress"] = float(np.mean(outside))
+    out["switch_false_alarm"] = float(np.nanmean(false_alarm))
+    out["n"] = n
     return out
 
 
@@ -207,10 +234,12 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
     plots.fig_forecasts(fsum, fig_dir / "forecasts.pdf")
 
     # ---- tables
+    calib = calib.assign(vrp_var=(calib["iv"] / 100) ** 2 - (calib["rv"] / 100) ** 2)
     report.table_calibration(calib, [
         ("rv", "Realised vol, annualised (\\%)", "calibration target $\\approx$ 50", 1),
         ("iv", "Mean BVIV (vol pts)", "35.5 (Aug 2026) to $>$96 (Feb 2026)", 1),
-        ("vrp", "IV $-$ subsequent 30d RV (vol pts)", "VRP $\\approx$ 0.14 p.a.\\ in variance", 1),
+        ("vrp", "IV $-$ subsequent 30d RV (vol pts)", "positive on average", 1),
+        ("vrp_var", "IV$^2-$RV$^2$ (variance units)", "$\\approx$ 0.14 in 2017--22 (higher vol)", 2),
         ("iv_above_rv", "Share of days IV $>$ RV (\\%)", "VRP positive on average", 0),
         ("corr_daily", "corr(daily return, $\\Delta$IV)", "sign varies by regime", 2),
         ("corr_down", "corr on falling 15m bars", "IV spikes in sell-offs", 2),
@@ -243,11 +272,15 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
     grid = med_all[med_all.index.str.startswith("ratchet|")]
     # the blue line of the frontier figure: unhedged origin, then the scaled static hedges
     line_x = np.r_[0.0, ladder["hedge_cost"].to_numpy()]
-    line_y = np.r_[0.0, ladder["es_red"].to_numpy()]
-    above = float((grid["es_red"].to_numpy() > np.interp(grid["hedge_cost"].to_numpy(), line_x, line_y)).mean())
+    line_y = np.maximum.accumulate(np.r_[0.0, ladder["es_red"].to_numpy()])   # efficient envelope of static scalings
+    above_mask = grid["es_red"].to_numpy() > np.interp(grid["hedge_cost"].to_numpy(), line_x, line_y)
+    above = float(above_mask.mean())
+    above_full_core = int((above_mask & grid.index.str.contains(r"\|1\|[01]$", regex=True)).sum())
     diag = crash_cluster_diagnostic(params, cfg, selection)
     rr, ss = rule_from_key(rt), rule_from_key(sw)
     f = fsum.set_index(["h", "model"])
+    loss = evals.pivot_table(index=["h", "seed"], columns="model", values="qlike")
+    blowups = int((loss["HAR-IV"] > 2 * loss["HAR"]).sum())          # paths x horizons with a collapse
     nums = {
         "n_test": f"{test['seed'].nunique()}", "n_train": f"{json.loads((RESULTS / 'selection.json').read_text())['train_seeds'][1] - TRAIN_SEED0}",
         "n_rules": f"{len(rule_grid()) - 1}", "sim_days": f"{params.days}",
@@ -269,6 +302,21 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
         "share_tail_ratchet": f"{100 * d_tail['share_pos']:.0f}", "d_es_switch_lo": signed(d_sw['lo']), "d_es_switch_hi": signed(d_sw['hi']),
         "d_es_fc": signed(d_fc['mean']), "d_es_fc_lo": signed(d_fc['lo']), "d_es_fc_hi": signed(d_fc['hi']),
         "share_above_ladder": f"{100 * above:.0f}", "n_ratchet_grid": f"{len(grid)}",
+        "n_above_ladder": f"{int(round(above * len(grid)))}", "n_above_full_core": f"{above_full_core}",
+        "ratchet_twin": "unsized" if rr.use_forecast else "forecast-sized",
+        "tail_outside_stress": f"{100 * diag['tail_outside_stress']:.0f}", "switch_false_alarm": f"{100 * diag['switch_false_alarm']:.0f}",
+        "diag_paths": f"{diag['n']}",
+        "pgrid_floor_zero_abs": f"{abs(pgrid['floor_zero']):.2f}", "pgrid_sig_pos_zero": f"{pgrid['sig_pos_zero']}",
+        "pgrid_n_zero": f"{pgrid['n_zero']}", "pgrid_neg_point": f"{pgrid['neg_point']}",
+        "cost_placebo": f"{med_tab.loc['placebo', 'hedge_cost']:.2f}",
+        "es_vix_always": robust.set_index("scenario").loc["VIX-like spot-vol", "es_always"],
+        "es_inverse_always": robust.set_index("scenario").loc["Inverse leverage", "es_always"],
+        "es_cluster_always": robust.set_index("scenario").loc["Crashes cluster in stress", "es_always"],
+        "es_cluster_ratchet": robust.set_index("scenario").loc["Crashes cluster in stress", "es_ratchet"],
+        "rob_cost_min": signed(robust[robust.scenario.str.contains("costs|carry")]["d_mean"].min()),
+        "rob_cost_max": signed(robust[robust.scenario.str.contains("costs|carry")]["d_mean"].max()),
+        "vrp_var": f"{((calib['iv'] / 100) ** 2 - (calib['rv'] / 100) ** 2).median():.2f}",
+        "d_es_switch_abs": f"{abs(d_sw['mean']):.2f}", "d_var_ratchet_abs": f"{abs(d_var['mean']):.2f}",
         "diag_base_always": signed(diag['base']['always|1']), "diag_base_ratchet": signed(diag['base'][rt]),
         "diag_cluster_always": signed(diag['cluster']['always|1']), "diag_cluster_ratchet": signed(diag['cluster'][rt]),
         "ratchet_z": f"{rr.z_enter:g}", "ratchet_hl": f"{rr.halflife_days:g}", "ratchet_floor": f"{rr.floor:g}",
@@ -280,6 +328,9 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
         "ql_har_iv_seven": f"{f.loc[(7, 'HAR-IV'), 'qlike_ratio']:.2f}", "ql_iv_seven": f"{f.loc[(7, 'IV'), 'qlike_ratio']:.2f}",
         "dm_win_har_iv_one": f"{f.loc[(1, 'HAR-IV'), 'dm_win']:.0f}", "dm_loss_har_iv_one": f"{f.loc[(1, 'HAR-IV'), 'dm_loss']:.0f}",
         "dm_win_iv_thirty": f"{f.loc[(30, 'IV'), 'dm_win']:.0f}", "dm_loss_iv_thirty": f"{f.loc[(30, 'IV'), 'dm_loss']:.0f}",
+        "dm_win_har_iv_seven": f"{f.loc[(7, 'HAR-IV'), 'dm_win']:.0f}", "dm_loss_har_iv_seven": f"{f.loc[(7, 'HAR-IV'), 'dm_loss']:.0f}",
+        "ql_har_iv_one_mean": f"{f.loc[(1, 'HAR-IV'), 'qlike']:.3f}", "ql_har_one_mean": f"{f.loc[(1, 'HAR'), 'qlike']:.3f}",
+        "har_iv_blowups": f"{blowups}",
         "corr_daily": f"{calib['corr_daily'].median():.2f}", "corr_down": f"{calib['corr_down'].median():.2f}",
         "corr_up": f"{calib['corr_up'].median():.2f}", "vrp": calib["vrp"].median(),
         "hedge_carry": f"{params.hedge_carry:g}", "fee": f"{cfg.fee_bps:g}", "slip": f"{cfg.slippage_bps:g}",
@@ -302,9 +353,49 @@ def stage_paper(params: MarketParams, cfg: HedgeConfig, selection: dict[str, str
         nums[key.replace("rob.", "rob lo.")] = signed(r['d_lo'])
         nums[key.replace("rob.", "rob hi.")] = signed(r['d_hi'])
     report.write_numbers(nums, PAPER / "numbers.tex")
+    if PAPER == ROOT / "paper":
+        write_readme_results(med_tab, [("always|1", "Always-on minimum-variance hedge"), ("always|1.5", "Always-on, scaled 1.5×"),
+                                       (sw, "VWAP-switch"), (rt, "**VWAP-ratchet** (MV core + breakdown overlay)"),
+                                       ("placebo", "Ratchet with placebo timing")], nums)
 
     if compile_pdf:
         compile_paper()
+
+
+def write_readme_results(med: pd.DataFrame, rows: list[tuple[str, str]], nums: dict, path: Path = ROOT / "README.md"):
+    """Regenerate the README's key-results block from the same numbers as the paper."""
+    def plain(v):
+        text = str(v).replace("\\ensuremath{-}", "−") if isinstance(v, str) else f"{v:.1f}"
+        return re.sub(r"(?<![\w.])-(?=\d)", "−", text)          # typographic minus for negative numbers
+    table = ["| Rule | ES reduction | Variance reduction | Hedge cost (% p.a.) | Turnover |", "|---|---|---|---|---|"]
+    for key, label in rows:
+        r = med.loc[key]
+        table.append(f"| {label} | {r['es_red']:.1f}% | {r['var_red']:.1f}% | {r['hedge_cost']:.2f} | {r['turnover']:.1f}× |")
+    n = {k: plain(v) for k, v in nums.items()}
+    block = "\n".join([
+        "<!-- RESULTS:START (generated by scripts/run_paper.py) -->",
+        f"Out-of-sample results on {n['n_test']} simulated test paths; rules were selected on {n['n_train']} separate "
+        "training paths. ES = expected shortfall (97.5%) of daily returns, net of carry and trading costs. "
+        "Turnover = BVIV-perp notional traded per year as a multiple of BTC notional.",
+        "", *table, "",
+        f"1. **Forecasting.** HAR-IV (in logs) is best at 1 day (QLIKE {n['ql_har_iv_one']} × HAR) and 7 days "
+        f"({n['ql_har_iv_seven']} × HAR); the bias-corrected implied index is best at 30 days ({n['ql_iv_thirty']} × HAR).",
+        f"2. **BVIV hedges are partial.** The spot-vol correlation is weak ({n['corr_daily']} daily) and changes sign by regime; "
+        f"the minimum-variance hedge cuts ES by {n['es_red_always']}% for {n['cost_always']}% of notional a year.",
+        f"3. **Naive VWAP switching fails.** Its ES reduction trails the always-on hedge by {n['d_es_switch_abs']} pp "
+        f"at a turnover of {n['turn_switch']}×.",
+        f"4. **The ratchet's gain over the MV hedge ({n['d_es_ratchet']} pp ES, 95% CI [{n['d_es_ratchet_lo']}, "
+        f"{n['d_es_ratchet_hi']}]) is a size effect:** a placebo with the same trigger statistics but scrambled timing "
+        f"does as well ({n['d_es_placebo']} pp, CI [{n['d_es_placebo_lo']}, {n['d_es_placebo_hi']}]), and a 1.5× static "
+        f"hedge reaches the same ES reduction ({n['es_red_always_onehalf']}%).",
+        f"5. **VWAP timing information is real but secondary.** Across {n['pgrid_n']} ratchet configurations (first "
+        f"{n['pgrid_paths']} test paths), {n['pgrid_sig_pos']} beat their placebo at the 5% level and none loses significantly. "
+        f"Timing adds {n['pgrid_floor_zero']} pp without a core hedge and {n['pgrid_floor_one']} pp with a full core.",
+        "<!-- RESULTS:END -->",
+    ])
+    text = path.read_text()
+    start, end = text.index("<!-- RESULTS:START"), text.index("<!-- RESULTS:END -->") + len("<!-- RESULTS:END -->")
+    path.write_text(text[:start] + block + text[end:])
 
 
 def compile_paper():
@@ -335,12 +426,26 @@ def run_live(args, cfg: HedgeConfig, selection: dict[str, str]):
     else:
         index = data.load_index_csv(args.iv)
     bars = data.assemble_live_bars(klines, index, perp, funding)
-    out = analyse(bars, cfg.with_(instrument=args.book), final_rules(selection)[:4])
+    days = (bars.index[-1] - bars.index[0]).days
+    need = Protocol().forecast_eval_start + 90
+    if days < need:
+        raise SystemExit(f"live window has {days} days; at least {need} are needed (forecast evaluation starts on day "
+                         f"{Protocol().forecast_eval_start}, hedging on day {Protocol().hedge_eval_start})")
+    base = rule_from_key(selection["ratchet"])
+    placebos = [Rule(f"placebo|{d}", "ratchet", z_enter=base.z_enter, halflife_days=base.halflife_days, floor=base.floor,
+                     use_forecast=base.use_forecast, placebo_shift_days=float(d))
+                for d in range(7, days - 7, 7)]                       # every weekly shift: the placebo distribution
+    out = analyse(bars, cfg.with_(instrument=args.book), [*final_rules(selection)[:4], *placebos])
     RESULTS.mkdir(exist_ok=True)
     out["metrics"].to_csv(RESULTS / "live_metrics.csv")
     for h, ev in out["evals"].items():
         ev.to_csv(RESULTS / f"live_forecast_eval_h{h}.csv")
-    print(out["metrics"].round(2).to_string())
+    m = out["metrics"]
+    fake = m.loc[m.index.str.startswith("placebo|"), "es_red"]
+    real = m.loc[selection["ratchet"], "es_red"]
+    print(m.loc[~m.index.str.startswith("placebo|")].round(2).to_string())
+    print(f"timing placebo: ratchet ES reduction {real:.2f}% vs. {len(fake)} weekly shifts: mean {fake.mean():.2f}%, "
+          f"share of shifts beaten {100 * (real > fake).mean():.0f}% (one path: judge against this distribution)")
 
 
 def main():
