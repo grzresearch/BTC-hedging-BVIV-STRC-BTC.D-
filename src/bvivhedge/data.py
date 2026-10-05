@@ -98,22 +98,35 @@ def parse_binance_klines(csv_bytes: bytes) -> pd.DataFrame:
     return out
 
 
-def fetch_binance_klines(start: str, end: str, symbol: str = "BTCUSDT", market: str = "spot") -> pd.DataFrame:
-    """15m klines from the monthly bulk archive, ``start``/``end`` as 'YYYY-MM' (inclusive)."""
+def fetch_binance_klines(start: str, end: str, symbol: str = "BTCUSDT", market: str = "spot",
+                         until: str | None = None) -> pd.DataFrame:
+    """15m klines from the monthly bulk archive, ``start``/``end`` as 'YYYY-MM' (inclusive).
+
+    ``until`` (a date, exclusive) stops the daily fallback at the end of the sample, so a month whose
+    daily files are all cached is read without touching the network.
+    """
     base = {"spot": "spot", "perp": "futures/um"}[market]
     frames = []
-    today = pd.Timestamp.now(tz="UTC").floor("1D")
+    stop = pd.Timestamp.now(tz="UTC").floor("1D")
+    if until is not None:
+        stop = min(stop, pd.Timestamp(until, tz="UTC"))
     for month in pd.period_range(start, end, freq="M"):
         fname = f"{symbol}-15m-{month.year}-{month.month:02d}.zip"
         url = f"https://data.binance.vision/data/{base}/monthly/klines/{symbol}/15m/{fname}"
+        days = [d for d in pd.date_range(month.start_time, month.end_time.normalize(), freq="D")
+                if d.tz_localize("UTC") < stop]
+        if not days:                                            # the month lies entirely after the sample
+            continue
+        daily_names = [f"binance_{market}_{symbol}-15m-{d:%Y-%m-%d}.zip" for d in days]
+        cached_daily = not (RAW / f"binance_{market}_{fname}").exists() and all((RAW / n).exists() for n in daily_names)
         try:
+            if cached_daily:
+                raise FileNotFoundError("use the cached daily files")
             blobs = [_cached(f"binance_{market}_{fname}", lambda u=url: _get(u, retries=1))]
         except Exception:
             # the monthly file appears a few days after month end: fall back to daily files
             blobs = []
-            for day in pd.date_range(month.start_time, month.end_time.normalize(), freq="D"):
-                if day.tz_localize("UTC") >= today:
-                    break
+            for day in days:
                 dname = f"{symbol}-15m-{day:%Y-%m-%d}.zip"
                 durl = f"https://data.binance.vision/data/{base}/daily/klines/{symbol}/15m/{dname}"
                 blobs.append(_cached(f"binance_{market}_{dname}", lambda u=durl: _get(u)))
@@ -300,17 +313,22 @@ def parse_deribit_funding(payload: bytes) -> pd.Series:
 
 
 def fetch_deribit_funding(start: str, end: str, instrument: str = "BTC-PERPETUAL") -> pd.Series:
-    """Hourly realised funding of the Deribit BTC perpetual (fraction of notional per hour)."""
+    """Hourly realised funding of the Deribit BTC perpetual (fraction of notional per hour), ``end`` exclusive."""
     parts = []
-    for month in pd.period_range(pd.Timestamp(start).to_period("M"), pd.Timestamp(end).to_period("M"), freq="M"):
+    stop = pd.Timestamp(end)
+    for month in pd.period_range(pd.Timestamp(start).to_period("M"), stop.to_period("M"), freq="M"):
         for half in (0, 1):                                    # the endpoint caps the number of rows
             a = month.start_time + pd.Timedelta(days=15 * half)
-            b = month.start_time + pd.Timedelta(days=15) if half == 0 else (month + 1).start_time
+            full = month.start_time + pd.Timedelta(days=15) if half == 0 else (month + 1).start_time
+            if a >= stop:                                       # the half-month lies after the sample
+                continue
+            b = min(full, stop)
             t0, t1 = int(a.tz_localize("UTC").timestamp() * 1000), int(b.tz_localize("UTC").timestamp() * 1000)
             url = (f"https://www.deribit.com/api/v2/public/get_funding_rate_history?instrument_name={instrument}"
                    f"&start_timestamp={t0}&end_timestamp={t1}")
+            name = f"deribit_funding_{instrument}_{t0}" + ("" if b == full else f"_to_{t1}") + ".json"
             complete = b.tz_localize("UTC") <= pd.Timestamp.now(tz="UTC")
-            blob = _cached(f"deribit_funding_{instrument}_{t0}.json", lambda u=url: _get(u)) if complete else _get(url)
+            blob = _cached(name, lambda u=url: _get(u)) if complete else _get(url)
             parts.append(parse_deribit_funding(blob))
     s = pd.concat(parts).sort_index()
     return s[~s.index.duplicated()]
