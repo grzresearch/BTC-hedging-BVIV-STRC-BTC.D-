@@ -2,7 +2,10 @@
 
 **Evidence from the BVIV and STRC perpetuals on volatility forecasts, funding costs and 15-minute VWAP timing**
 
-📄 **Paper:** [`paper/main.pdf`](paper/main.pdf) (10 pages including references)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+**Paper:** [`paper/main.pdf`](paper/main.pdf) (10 pages including references)
 
 A perpetual future on the Volmex **BVIV** index (30-day BTC implied volatility) has traded on Bitfinex since April 2024. This repository uses its full record to ask three questions:
 
@@ -11,6 +14,18 @@ A perpetual future on the Volmex **BVIV** index (30-day BTC implied volatility) 
 3. Does a **short position in STRC**, the variable-rate preferred stock with which Strategy Inc. funds its bitcoin (Nasdaq since July 2025, a Hyperliquid perpetual `xyz:STRC` since June 2026), work as a crash hedge under the same rules?
 
 The data are Binance BTCUSDT 15-minute bars and the official Volmex BVIV index from 2023-01 to 2026-10, and the Bitfinex perpetual's marks, quotes, trades, open interest and every funding settlement since its listing in April 2024. The hedging rules are frozen on simulated training data, so the live sample is out of sample for the rules. For STRC, the data are its hourly Nasdaq prices and every dividend since the listing, and the perpetual's 15-minute marks, oracle prices, open interest, order books and hourly funding. A calibrated simulation with an arbitrage-free perpetual serves as a controlled experiment. One pipeline generates every table, figure and result in the paper.
+
+## Contents
+
+- [Key results](#key-results)
+- [How it works](#how-it-works)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Data sources](#data-sources)
+- [Repository layout](#repository-layout)
+- [Disclaimer](#disclaimer)
+- [License](#license)
+- [Use of AI tools](#use-of-ai-tools)
 
 ## Key results
 
@@ -61,6 +76,40 @@ Live data, 3 April 2024 to 3 October 2026 (914 days): a 1-BTC spot book hedged w
 * **STRC: same rules, short instead of long** (`src/bvivhedge/strc.py`, `scripts/run_strc.py`). The engine takes a hedge direction, so the frozen rules short STRC whenever the EWMA slope of BTC returns on STRC price changes is positive. Our STRC history is hourly: STRC is observed at the official open and close of every session (an exchange calendar, not the bars a source returns; the official prints fill gaps in the hourly data) and at each hourly close, the slope uses synchronous moves only, a decision is filled at the next observation, a Nasdaq short pays every dividend and a 1% borrow fee (no interest on the short-sale proceeds), and books are compared over US trading days so that a weekend BTC move meets STRC's Monday gap. On the perpetual the same hedge ratio trades every 15 minutes around the clock, pays funding instead of dividends and pays the slippage measured on its order book at the session closes. The notional cap carries the BVIV study's risk budget over (half the BTC notional, scaled by the BVIV/STRC volatility ratio, STRC as total return, over STRC's first 30 calendar days).
 * **No look-ahead.** Every signal and forecast is causal. Tests confirm that truncating the sample leaves past values of the VWAP signal, the hedge ratios and the regression forecasts unchanged.
 
+## Installation
+
+Python 3.10 or later (the results were produced with Python 3.11.15).
+
+```bash
+git clone https://github.com/grzresearch/BTC-hedging-BVIV-STRC-BTC.D-.git
+cd BTC-hedging-BVIV-STRC-BTC.D-
+pip install -r requirements.txt           # or requirements-lock.txt: the exact versions behind results/
+```
+
+`requirements-lock.txt` pins the exact environment behind `results/` and `paper/`; `results/environment.json` and `results/live/facts.json` record the package versions of each run. Building the PDF needs `latexmk` with a standard TeX distribution (TeX Live or TinyTeX).
+
+## Usage
+
+```bash
+python -m pytest                          # ~15 s
+python scripts/fetch_data.py              # first run downloads ~2.6 million Bitfinex snapshots (BVIV and BTC perp)
+python scripts/run_live.py                # live study, ~10 min on 4 cores -> results/live/
+python scripts/run_strc.py                # STRC study, ~2 min -> results/strc/ (needs OXARCHIVE_API_KEY unless data/raw is cached)
+python scripts/run_paper.py --stage paper # tables, figures, numbers and paper/main.pdf from cached results (seconds)
+python scripts/run_paper.py               # full simulation study, 1-2 h on 4 cores, then the paper
+python scripts/run_paper.py --quick       # smoke run of the simulation (8 paths), written to results/quick/
+```
+
+`scripts/run_paper.py --help` lists the stages of the simulation study (`train`, `train-delay`, `test`, `robust`, `placebo`, `placebo-grid`, `paper`); `--no-pdf` skips the LaTeX build. The paper stage also regenerates the key-results block of this README.
+
+## Data sources
+
+* **Live BVIV study.** The live data come from public endpoints that need no key: `data.binance.vision` (BTC klines), `rest-v1.volmex.finance` (BVIV index), `api-pub.bitfinex.com` (perpetual status, trade candles, BTC-perp funding) and `www.deribit.com` (fallback BTC funding, used only if Bitfinex fails and then recorded in `results/live/facts.json`).
+* **Caching.** Every window that has ended is cached in `data/raw/`, so a rerun with the same dates is offline. The one input without public history is the order-book snapshot of 4 October 2026, kept in `results/live/book_snapshot.json`.
+* **STRC study.** The STRC study reads STRC prices from Yahoo's chart API, dividends from `api.nasdaq.com` and the perpetual's hourly funding from `api.hyperliquid.xyz`, all public; the perpetual's 15-minute marks, candles and oracle prices, its open interest and its order-book snapshots come from 0xArchive, which needs an API key in `OXARCHIVE_API_KEY` (never stored in the repository; the raw replies are cached in `data/raw/`, which is not tracked).
+* **Availability.** Yahoo serves hourly history for the last 730 days only, so a fresh download of STRC's hourly prices from its July 2025 listing works until about July 2027.
+* **Further loaders.** `data.py` also has loaders for the Hyperliquid `mkts:BVIV` market (listed September 2026, too short for this study), Deribit DVOL and CSV exports of BVIV.
+
 ## Repository layout
 
 ```
@@ -88,22 +137,10 @@ tests/                 60 tests: accounting identities, causality, index expecta
                        placebo trigger counts, funding reconstruction and timing, parsers, short and exchange-hours hedges
 results/               live results (results/live/, results/strc/), cached Monte Carlo results, the rule selection,
                        the package versions behind each run (environment.json, live/facts.json)
+data/                  local cache of downloaded inputs (data/raw/, not tracked)
+pyproject.toml         package metadata and pytest configuration
+requirements.txt       dependencies; requirements-lock.txt pins the exact versions behind results/
 ```
-
-## Reproduce
-
-```bash
-pip install -r requirements.txt           # or requirements-lock.txt: the exact versions behind results/
-python -m pytest                          # ~15 s
-python scripts/fetch_data.py              # first run downloads ~2.6 million Bitfinex snapshots (BVIV and BTC perp)
-python scripts/run_live.py                # live study, ~10 min on 4 cores -> results/live/
-python scripts/run_strc.py                # STRC study, ~2 min -> results/strc/ (needs OXARCHIVE_API_KEY unless data/raw is cached)
-python scripts/run_paper.py --stage paper # tables, figures, numbers and paper/main.pdf from cached results (seconds)
-python scripts/run_paper.py               # full simulation study, 1-2 h on 4 cores, then the paper
-python scripts/run_paper.py --quick       # smoke run of the simulation (8 paths), written to results/quick/
-```
-
-Building the PDF needs `latexmk` with a standard TeX distribution (TeX Live or TinyTeX). The live data come from public endpoints that need no key: `data.binance.vision` (BTC klines), `rest-v1.volmex.finance` (BVIV index), `api-pub.bitfinex.com` (perpetual status, trade candles, BTC-perp funding) and `www.deribit.com` (fallback BTC funding, used only if Bitfinex fails and then recorded in `results/live/facts.json`). Every window that has ended is cached in `data/raw/`, so a rerun with the same dates is offline. The one input without public history is the order-book snapshot of 4 October 2026, kept in `results/live/book_snapshot.json`. The STRC study reads STRC prices from Yahoo's chart API, dividends from `api.nasdaq.com` and the perpetual's hourly funding from `api.hyperliquid.xyz`, all public; the perpetual's 15-minute marks, candles and oracle prices, its open interest and its order-book snapshots come from 0xArchive, which needs an API key in `OXARCHIVE_API_KEY` (never stored in the repository; the raw replies are cached in `data/raw/`, which is not tracked). Yahoo serves hourly history for the last 730 days only, so a fresh download of STRC's hourly prices from its July 2025 listing works until about July 2027. `data.py` also has loaders for the Hyperliquid `mkts:BVIV` market (listed September 2026, too short for this study), Deribit DVOL and CSV exports of BVIV.
 
 ## Disclaimer
 
